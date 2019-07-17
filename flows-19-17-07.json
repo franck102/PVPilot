@@ -1,0 +1,519 @@
+[
+    {
+        "id": "a2171f1b.b5993",
+        "type": "subflow",
+        "name": "Switch",
+        "info": "",
+        "category": "",
+        "in": [
+            {
+                "x": 20,
+                "y": 120,
+                "wires": [
+                    {
+                        "id": "fa5a64ad.ff8b38"
+                    }
+                ]
+            }
+        ],
+        "out": [],
+        "env": []
+    },
+    {
+        "id": "3903b461.2edc5c",
+        "type": "http request",
+        "z": "a2171f1b.b5993",
+        "name": "",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": false,
+        "url": "http://192.168.1.18/relay/{{{payload.relayChannel}}}?turn={{{payload.state}}}",
+        "tls": "",
+        "proxy": "",
+        "authType": "",
+        "x": 450,
+        "y": 280,
+        "wires": [
+            [
+                "e0626217.0c8d9"
+            ]
+        ]
+    },
+    {
+        "id": "fa5a64ad.ff8b38",
+        "type": "split",
+        "z": "a2171f1b.b5993",
+        "name": "Split requests",
+        "splt": "\\n",
+        "spltType": "str",
+        "arraySplt": 1,
+        "arraySpltType": "len",
+        "stream": false,
+        "addname": "consumer",
+        "x": 180,
+        "y": 120,
+        "wires": [
+            [
+                "9a72148a.b711d8"
+            ]
+        ]
+    },
+    {
+        "id": "e0626217.0c8d9",
+        "type": "function",
+        "z": "a2171f1b.b5993",
+        "name": "Update states",
+        "func": "var now = Date.now() / 1000;\n\nif (msg.statusCode == 200) {\n    var consumer = msg.parts.key;\n    var state = flow.get('$parent.states', 'file')[consumer];\n    state.startCount = 0;\n    state.stopCount = 0;\n    if (msg.payload.ison) {\n        if (state.startTime < 0) {\n            state.startTime = now;\n        }\n        msg.debug = consumer + \" state: ON\";\n    }\n    else {\n        if (state.startTime >= 0) {\n            state.dayTotal += (now - state.startTime)/60;\n            state.startTime = -1;\n        }\n        var c = flow.get('$parent.consumers')[consumer];\n        if (! c.powerKeepLast) {\n            state.power = c.power;\n        }\n        msg.debug = consumer + \" state: OFF\";\n}\n}\nelse {\n    node.warn(\"Shelly request failed: \" + msg.payload.responseUrl);\n}\n\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 440,
+        "y": 380,
+        "wires": [
+            [
+                "4a2d78b3.7ecbb8"
+            ]
+        ]
+    },
+    {
+        "id": "4a2d78b3.7ecbb8",
+        "type": "debug",
+        "z": "a2171f1b.b5993",
+        "name": "",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "debug",
+        "targetType": "msg",
+        "x": 710,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "9a72148a.b711d8",
+        "type": "function",
+        "z": "a2171f1b.b5993",
+        "name": "Extract channel",
+        "func": "\nmsg.payload.relayChannel = flow.get(\"$parent.consumers\")[msg.consumer]['relayChannel']\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 420,
+        "y": 160,
+        "wires": [
+            [
+                "3903b461.2edc5c"
+            ]
+        ]
+    },
+    {
+        "id": "d10c0024.230db",
+        "type": "tab",
+        "label": "PV Pilot",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "1387751d.458e8b",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "controlLoop",
+        "func": "var P_avail_total = msg.payload;\nvar consumers = flow.get('consumers');\nvar schedules = flow.get('schedules');\nvar states = flow.get('states', 'file');\nvar date = new Date();\nvar now = date.getTime() / 1000;\n// timezone offset = 2h in Paris\nvar hour = 2 + date.getHours();\nvar switches = {};\nvar results = {};\nfor (var name in consumers) {\n    results[name] = {\n        \"window\": 0,\n        // device should be off unless a schedule says otherwise\n        \"shouldRun\": false,\n        \"running\": states[name].startTime > 0,\n        'schedule': ''\n    };\n}\n\nvar P_left = P_avail_total;\nvar pvRatios = flow.get('pvRatios');\n\nschedules.forEach(function(schedule) {\n    var c = consumers[schedule.consumer];\n    var state = states[schedule.consumer];\n    var result = results[schedule.consumer];\n\n    // Does the schedule apply to the current window\n    var windowStart = result.window;\n    result.window = windowStart + schedule.dailyTime;\n    if (windowStart <= state.dayTotal && state.dayTotal < result.window) {\n        var adjustedPower = state.power * pvRatios[hour];\n        var running = state.startTime > 0;\n        result.schedule = windowStart + ' - ' + result.window + ': ' + \n            state.power + '/' + adjustedPower + 'W';\n            \n        if (P_left >= adjustedPower) {\n            if (! running) {\n                state.startCount++;\n            }\n            state.stopCount = 0;\n        }\n        else {\n            state.startCount = 0;\n            if (running) {\n                state.stopCount++;\n            }\n        }\n        \n        var shouldRun = \n            // Allow standby to program & start appliances\n            state.power < 10 ||\n            // Catch up at the end of the day\n            (hour >= 20 && ! c.pvOnly) ||\n            // Normal start, enough PV prod\n            (state.startCount >= 3) ||\n            // Currently running, missing PV not confirmed yet\n            (running && state.stopCount < 3);\n            \n        if (shouldRun) {\n            result.shouldRun = true;\n            P_left -= adjustedPower;\n        }\n    }\n});\n\nfor (name in results) {\n    delete results[name].window;\n}\nreturn { \"payload\": results }; \n\n",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 330,
+        "y": 380,
+        "wires": [
+            [
+                "36f64798.0e0318",
+                "5b8b2e47.b12a6"
+            ]
+        ]
+    },
+    {
+        "id": "2c45f003.eccbc",
+        "type": "inject",
+        "z": "d10c0024.230db",
+        "name": "Reset daily counters",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "repeat": "",
+        "crontab": "00 04 * * *",
+        "once": false,
+        "onceDelay": 0.1,
+        "x": 160,
+        "y": 140,
+        "wires": [
+            [
+                "637e2ae3.881354"
+            ]
+        ]
+    },
+    {
+        "id": "637e2ae3.881354",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Reset daily times",
+        "func": "\nvar consumers = flow.get('consumers');\nvar states = {};\n\nfor (var name in consumers) {\n    var c = consumers[name];\n    states[name] = {\n            \"startTime\": -1,\n            \"dayTotal\": 0,\n            \"power\": c.power\n        };\n}\nflow.set('states', states, 'file');\nnode.warn(\"Daily work times have been reset\");\n\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 410,
+        "y": 140,
+        "wires": [
+            [
+                "461b932e.af52ac"
+            ]
+        ]
+    },
+    {
+        "id": "28a4c98e.508796",
+        "type": "mqtt in",
+        "z": "d10c0024.230db",
+        "name": "PAST",
+        "topic": "iotawatt/PAST",
+        "qos": "0",
+        "datatype": "auto",
+        "broker": "c2ae6ac2.70b408",
+        "x": 90,
+        "y": 280,
+        "wires": [
+            [
+                "d471ed6f.0019d"
+            ]
+        ]
+    },
+    {
+        "id": "a7c1c7a9.5e6ea8",
+        "type": "debug",
+        "z": "d10c0024.230db",
+        "name": "Consumer power",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "x": 730,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "d6a5dc60.61b04",
+        "type": "mqtt in",
+        "z": "d10c0024.230db",
+        "name": "Power updates",
+        "topic": "consos/+",
+        "qos": "0",
+        "datatype": "auto",
+        "broker": "c2ae6ac2.70b408",
+        "x": 120,
+        "y": 220,
+        "wires": [
+            [
+                "bc0eacbe.1d29"
+            ]
+        ]
+    },
+    {
+        "id": "bc0eacbe.1d29",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Update consumer power",
+        "func": "var parts = msg.topic.split('/');\nvar topic = parts[parts.length -1];\nvar states = flow.get('states', 'file');\nvar now = Date.now() / 1000;\nfor (var cname in states) {\n    //node.warn(topic + ' sv ' + cname);\n    if (cname == topic) {\n    var state = states[cname];\n        //node.warn('now: ' + now + ', start: ' + state.startTime);\n        if (state.startTime > 0) {\n            state.power = Number(msg.payload);\n        }\n    }\n}\nflow.set('states', states, 'file');\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 450,
+        "y": 220,
+        "wires": [
+            [
+                "a7c1c7a9.5e6ea8"
+            ]
+        ]
+    },
+    {
+        "id": "36f64798.0e0318",
+        "type": "debug",
+        "z": "d10c0024.230db",
+        "name": "Target state",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "x": 610,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "28ed16a8.36287a",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "computePowerAvailable",
+        "func": "// Compute total power available for routing by adding what is injected and what is currently\n// being routed\nvar P_avail = - Number(msg.payload);\nvar states = flow.get('states', 'file');\nmsg.debug = P_avail;\nfor (var name in states) {\n    var state = states[name];\n    if (state.startTime > 0) {\n        P_avail += state.power;\n        msg.debug += ' + ' + state.power;\n        //node.warn(\"Added \" + c.state.power + \"W for \" + name);\n    }\n}\nmsg.payload = P_avail;\nmsg.debug += ' = ' + P_avail;\nreturn msg;\n",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 470,
+        "y": 280,
+        "wires": [
+            [
+                "55d8ede6.fffef4",
+                "2b628a5a.9fb746"
+            ]
+        ]
+    },
+    {
+        "id": "55d8ede6.fffef4",
+        "type": "debug",
+        "z": "d10c0024.230db",
+        "name": "Power available",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "debug",
+        "targetType": "msg",
+        "x": 780,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "2b628a5a.9fb746",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Update times",
+        "func": "var states = flow.get('states', 'file');\nvar now = Date.now() / 1000;\n\nfor (var name in states) {\n    var state = states[name];\n    if (state.startTime > 0) {\n        state.dayTotal += (now - state.startTime)/60;\n        state.startTime = now;\n    }\n}\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 130,
+        "y": 380,
+        "wires": [
+            [
+                "1387751d.458e8b"
+            ]
+        ]
+    },
+    {
+        "id": "123ed89.39f3927",
+        "type": "subflow:a2171f1b.b5993",
+        "z": "d10c0024.230db",
+        "name": "Switch Consumers",
+        "env": [],
+        "x": 230,
+        "y": 520,
+        "wires": []
+    },
+    {
+        "id": "461b932e.af52ac",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Switch all off",
+        "func": "var consumers = flow.get('consumers');\nvar requests = {};\nfor (var consumer in consumers) {\n    requests[consumer] = { 'state': 'off' };\n}\n\nreturn { 'payload': requests };",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 610,
+        "y": 140,
+        "wires": [
+            [
+                "de9838f1.e5cc58"
+            ]
+        ]
+    },
+    {
+        "id": "de9838f1.e5cc58",
+        "type": "subflow:a2171f1b.b5993",
+        "z": "d10c0024.230db",
+        "name": "",
+        "x": 790,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "de6eb998.d39b08",
+        "type": "config",
+        "z": "d10c0024.230db",
+        "name": "Consumers",
+        "properties": [
+            {
+                "p": "consumers",
+                "pt": "flow",
+                "to": "{\"cumulus\":{\"relayChannel\":1,\"power\":1200,\"pvOnly\":false},\"chargeurVelo\":{\"relayChannel\":0,\"power\":120,\"pvOnly\":false},\"poolPump\":{\"relayChannel\":2,\"power\":1400,\"pvOnly\":true},\"laveVaisselle\":{\"relayChannel\":3,\"power\":0,\"powerKeepLast\":true,\"pvOnly\":false}}",
+                "tot": "json"
+            },
+            {
+                "p": "schedules",
+                "pt": "flow",
+                "to": "[{\"consumer\":\"laveVaisselle\",\"dailyTime\":1200},{\"consumer\":\"cumulus\",\"dailyTime\":120},{\"consumer\":\"chargeurVelo\",\"dailyTime\":600},{\"consumer\":\"poolPump\",\"dailyTime\":30},{\"consumer\":\"cumulus\",\"dailyTime\":60},{\"consumer\":\"poolPump\",\"dailyTime\":120}]",
+                "tot": "json"
+            }
+        ],
+        "active": true,
+        "x": 130,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "3021b4b0.4b7e9c",
+        "type": "inject",
+        "z": "d10c0024.230db",
+        "name": "Startup",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "0",
+        "x": 120,
+        "y": 100,
+        "wires": [
+            [
+                "ab8e3d4c.723a2"
+            ]
+        ]
+    },
+    {
+        "id": "ab8e3d4c.723a2",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Initialize states",
+        "func": "\nvar consumers = flow.get('consumers');\nvar states = flow.get('states', 'file');\n\nfor (var name in consumers) {\n    if (typeof states[name] === \"undefined\") {\n        var c = consumers[name];\n        states[name] = {\n            \"startTime\": -1,\n            \"lastFlush\": -1,\n            \"dayTotal\": 0,\n            \"power\": c.power\n        };\n    }\n    states[name].startCount = 0;\n    states[name].stopCount = 0;\n}\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 360,
+        "y": 100,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "d471ed6f.0019d",
+        "type": "delay",
+        "z": "d10c0024.230db",
+        "name": "",
+        "pauseType": "delay",
+        "timeout": "2",
+        "timeoutUnits": "seconds",
+        "rate": "1",
+        "nbRateUnits": "1",
+        "rateUnits": "second",
+        "randomFirst": "1",
+        "randomLast": "5",
+        "randomUnits": "seconds",
+        "drop": false,
+        "x": 240,
+        "y": 280,
+        "wires": [
+            [
+                "28ed16a8.36287a"
+            ]
+        ]
+    },
+    {
+        "id": "a150e58b.6dde28",
+        "type": "inject",
+        "z": "d10c0024.230db",
+        "name": "",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "x": 120,
+        "y": 180,
+        "wires": [
+            [
+                "dea05c30.ef413"
+            ]
+        ]
+    },
+    {
+        "id": "1ed1482e.fc6e28",
+        "type": "debug",
+        "z": "d10c0024.230db",
+        "name": "",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "x": 490,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "dea05c30.ef413",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "",
+        "func": "\nvar date = new Date(msg.payload);\nmsg.payload = date.getHours();\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 270,
+        "y": 180,
+        "wires": [
+            [
+                "1ed1482e.fc6e28"
+            ]
+        ]
+    },
+    {
+        "id": "5b8b2e47.b12a6",
+        "type": "function",
+        "z": "d10c0024.230db",
+        "name": "Prepare switches",
+        "func": "var consumers = flow.get('consumers');\nvar states = flow.get('states', 'file');\n\nvar switches = {};\n\nfor (var name in msg.payload) {\n    var result = msg.payload[name];\n\n    if (result.running && ! result.shouldRun) {\n        // need to stop device\n        switches[name] = { \n            \"state\": \"off\", \n        };\n    }\n    else if (! result.running && result.shouldRun) {\n        // start the device\n        switches[name] = {  \n            \"state\": \"on\", \n        };\n    }\n}\nreturn { \"payload\": switches }; \n",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 550,
+        "y": 380,
+        "wires": [
+            [
+                "123ed89.39f3927"
+            ]
+        ]
+    },
+    {
+        "id": "ce69398e.2e1b38",
+        "type": "config",
+        "z": "d10c0024.230db",
+        "name": "PV Ratios",
+        "properties": [
+            {
+                "p": "pvRatios",
+                "pt": "flow",
+                "to": "[1,1,1,1,1,1,1,1,1,1,1,1,1,0.9,0.9,0.8,0.8,0.75,0.75,0.75,0.75,0.75,0.75,0.75]",
+                "tot": "json"
+            }
+        ],
+        "active": true,
+        "x": 340,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "c2ae6ac2.70b408",
+        "type": "mqtt-broker",
+        "z": "",
+        "name": "EmonPI",
+        "broker": "192.168.1.13",
+        "port": "1883",
+        "tls": "",
+        "clientid": "",
+        "usetls": false,
+        "compatmode": true,
+        "keepalive": "600",
+        "cleansession": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": ""
+    }
+]
